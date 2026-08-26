@@ -1,14 +1,15 @@
 # Python
+.venv/
 __pycache__/
 *.py[cod]
 .env
 .env.*
 
 # Large generated map outputs (kept locally, not in git)
-output/*.png
-output/*.tif
-output/*.pdf
-output/*.svg
+output/**/*.png
+output/**/*.tif
+output/**/*.pdf
+output/**/*.svg
 
 # Shapefile binaries (large; source data stays local)
 att/**/*.shp
