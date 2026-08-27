@@ -66,7 +66,11 @@ LAYER_COLORS = {
     "Landuse": (190, 210, 160, 255),
     "Terrain": (160, 140, 110, 255),
     "Contours": (130, 100, 70, 255),
+    "Parcels": (160, 90, 60, 255),
 }
+
+# Folder name tokens for MassGIS L3 / property tax parcel shapefiles (same as export_map site extent).
+PARCEL_FOLDER_HINTS = ("parcel", "tax", "plot", "property tax", "lot line")
 
 MAJOR_HIGHWAYS = {
     "motorway",
@@ -374,6 +378,117 @@ def _folder_hints(name: str) -> str:
     return name.lower().replace("_", " ").replace("-", " ")
 
 
+def _folder_is_parcel(name: str) -> bool:
+    hint = _folder_hints(name)
+    return any(token in hint for token in PARCEL_FOLDER_HINTS)
+
+
+def _ensure_gdf_source_crs(gdf, folder: Path, source_epsg: int):
+    """Match export_map.py: read .prj if needed, reproject to site EPSG (e.g. 26986)."""
+    import geopandas as gpd
+    from pyproj import CRS
+
+    if gdf.crs is None:
+        prj_files = sorted(folder.glob("*.prj"))
+        if prj_files:
+            gdf = gdf.set_crs(CRS.from_wkt(prj_files[0].read_text(encoding="utf-8", errors="replace")))
+        else:
+            print(f"  Assuming EPSG:{source_epsg} for '{folder.name}' (no CRS / .prj)")
+            gdf = gdf.set_crs(epsg=source_epsg)
+    else:
+        try:
+            data_epsg = gdf.crs.to_epsg()
+        except Exception:
+            data_epsg = None
+        if data_epsg != source_epsg:
+            print(f"  Reprojecting '{folder.name}' EPSG:{data_epsg or gdf.crs} -> EPSG:{source_epsg}")
+            gdf = gdf.to_crs(epsg=source_epsg)
+    return gdf
+
+
+def load_parcel_gis_features(
+    gis_folder: Path | None,
+    model_bounds: dict[str, float],
+    source_epsg: int,
+) -> list[dict]:
+    """Load property/plot parcel boundaries from local GIS (MassGIS L3 tax parcels, etc.)."""
+    if gis_folder is None or not gis_folder.is_dir():
+        return []
+
+    try:
+        import geopandas as gpd
+    except ImportError:
+        print("  WARNING: geopandas missing; cannot load parcel GIS layers.")
+        return []
+
+    clip_poly = Polygon(
+        [
+            (model_bounds["minx"], model_bounds["miny"]),
+            (model_bounds["maxx"], model_bounds["miny"]),
+            (model_bounds["maxx"], model_bounds["maxy"]),
+            (model_bounds["minx"], model_bounds["maxy"]),
+        ]
+    )
+
+    features: list[dict] = []
+    for sub in sorted(p for p in gis_folder.iterdir() if p.is_dir()):
+        if not _folder_is_parcel(sub.name):
+            continue
+
+        shps = sorted(sub.glob("*.shp"))
+        if not shps:
+            print(f"  WARNING: parcel folder '{sub.name}' has no .shp files.")
+            continue
+
+        frames: list[gpd.GeoDataFrame] = []
+        for shp in shps:
+            try:
+                gdf = gpd.read_file(shp)
+            except Exception as exc:
+                print(f"  WARNING: could not read {shp.name}: {exc}")
+                continue
+            if gdf.empty or gdf.geometry.isna().all():
+                continue
+            gdf = _ensure_gdf_source_crs(gdf, sub, source_epsg)
+            frames.append(gdf)
+
+        if not frames:
+            continue
+
+        merged = gpd.GeoDataFrame(
+            gpd.pd.concat(frames, ignore_index=True),
+            crs=f"EPSG:{source_epsg}",
+        )
+        merged = merged[merged.geometry.notna() & ~merged.geometry.is_empty]
+        merged = merged[merged.intersects(clip_poly)].copy()
+        if merged.empty:
+            print(f"  Parcels '{sub.name}': 0 features inside model bounds.")
+            continue
+
+        merged["geometry"] = merged.geometry.intersection(clip_poly)
+        merged = merged[merged.geometry.notna() & ~merged.geometry.is_empty]
+
+        added = 0
+        for _, row in merged.iterrows():
+            geom = row.geometry
+            if geom is None or geom.is_empty:
+                continue
+            props = {"_source": "local_gis", "_parcel_layer": sub.name}
+            for col in row.index:
+                if col == "geometry":
+                    continue
+                val = row[col]
+                if val is not None and str(val) not in ("", "nan"):
+                    props[str(col)] = val
+            features.append({"geometry": geom, "properties": props})
+            added += 1
+        print(
+            f"  Parcels '{sub.name}': {added} features (EPSG:{source_epsg}, clipped to model bounds)"
+        )
+
+    return features
+
+
 def load_local_gis_features(
     gis_folder: Path | None,
     model_bounds: dict[str, float],
@@ -423,7 +538,7 @@ def load_local_gis_features(
         if gdf.crs is None:
             gdf = gdf.set_crs(epsg=source_epsg)
         else:
-            gdf = gdf.to_crs(epsg=source_epsg)
+            gdf = _ensure_gdf_source_crs(gdf, sub, source_epsg)
 
         gdf = gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty]
         if gdf.empty:
@@ -1020,10 +1135,12 @@ def write_site_model_readme(path: Path, info: dict[str, Any]) -> None:
             "",
             "Data sources (same family as Cadmapper):",
             "  Buildings / roads / parks / water: OpenStreetMap (ODbL)",
+            "  Parcel / plot lines: local GIS shapefiles (e.g. MassGIS L3 tax parcels)",
             "  Terrain mesh + contours: NASA SRTM via OpenTopoData / Open-Meteo",
             "",
             "Open site_model.3dm in Rhino.",
             "  Buildings: extruded solids; bottom centroid sits 1 m below terrain.",
+            "  Parcels: property boundary outlines draped on terrain.",
             "  Roads / parks / water / parking: curves draped on the terrain mesh.",
         ]
     )
@@ -1165,6 +1282,25 @@ def create_site_model(
             contour_count += 1
         layer_counts["Contours"] = contour_count
         print(f"  Contour polylines: {contour_count}")
+
+    parcel_features = load_parcel_gis_features(gis_folder, model_bounds, source_epsg)
+    if parcel_features:
+        parcel_idx = layer_index["Parcels"]
+        parcel_curves = 0
+        for feature in parcel_features:
+            geom = feature["geometry"]
+            for poly in iter_polygons(geom):
+                parcel_curves += add_polygon_outline_on_terrain(
+                    model, poly, parcel_idx, terrain, origin_x, origin_y, z_boost=0.08
+                )
+            for line in iter_lines(geom):
+                dense = densify_linestring(line)
+                if add_line_on_terrain(
+                    model, dense, parcel_idx, terrain, origin_x, origin_y, z_boost=0.08
+                ):
+                    parcel_curves += 1
+        layer_counts["Parcels"] = parcel_curves
+        print(f"  Parcel outline curves: {parcel_curves}")
 
     for feature in features:
         props = feature_props(feature["properties"])
