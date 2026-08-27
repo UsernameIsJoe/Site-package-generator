@@ -45,7 +45,7 @@ import xyzservices
 import xyzservices.providers as xyz
 from PIL import Image, ImageEnhance
 from pyproj import CRS, Geod, Transformer
-from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon, shape
 from shapely.geometry.base import BaseGeometry
 
 try:
@@ -113,10 +113,44 @@ AUTO_ZOOM = True
 ZOOM = 18
 MAX_ZOOM = 20
 
-# Image adjustments (same defaults as BaseMap_Creator.ipynb)
-SATURATION = 1.00
-CONTRAST = 2.00
+# Image adjustments (keep mild so the SW palette stays true).
+SATURATION = 1.08
+CONTRAST = 1.35
 BRIGHTNESS = 1.00
+SHARPNESS = 1.40
+
+# Sherwin-Williams seaside palette (sampled from your swatch / official hex).
+SW_SILVER_STRAND = (200, 203, 196)   # SW 7057 — secondary roads / soft gray-green
+SW_TRICORN_BLACK = (47, 47, 48)      # SW 6258 — major roads / strong lines
+SW_EGRET_WHITE = (223, 217, 207)     # SW 7570 — warm land fill
+SW_SNOWBOUND = (237, 234, 229)       # SW 7004 — map background
+SW_CULTURED_PEARL = (229, 220, 214)  # SW 6028 — buildings / residential
+SW_PORTSMOUTH = (118, 132, 130)      # SW 9644 — water
+SW_MINIMALIST = (202, 190, 173)      # SW 9611 — sand / warm land accents
+SW_EVENTIDE = (163, 175, 172)        # SW 9643 — parks / openspace / woods
+
+# Overlay fills (RGBA). A = opacity 0–255.
+OPENSPACE_LOCAL_RGBA = (*SW_EVENTIDE, 150)
+OPENSPACE_OSM_RGBA = (*SW_EVENTIDE, 110)
+BASEMAP_PARK_RGB = SW_EVENTIDE
+BASEMAP_WOOD_RGB = SW_SILVER_STRAND
+
+# Full basemap palette passed into MapLibre style recolor.
+BASEMAP_PALETTE = {
+    "background": SW_SNOWBOUND,
+    "land": SW_EGRET_WHITE,
+    "residential": SW_CULTURED_PEARL,
+    "building": SW_MINIMALIST,
+    "park": SW_EVENTIDE,
+    "wood": SW_SILVER_STRAND,
+    "water": SW_PORTSMOUTH,
+    "road_major": SW_SILVER_STRAND,  # same as minor roads
+    "road_minor": SW_SILVER_STRAND,
+    "road_path": SW_MINIMALIST,
+    "rail": SW_PORTSMOUTH,
+    "sand": SW_MINIMALIST,
+    "boundary": SW_PORTSMOUTH,
+}
 
 # Basemap print resolution. Output pixels = SVG canvas points * (OUTPUT_DPI / 72).
 OUTPUT_DPI = 300
@@ -899,7 +933,137 @@ def apply_image_adjustments(image: Image.Image) -> Image.Image:
     image = ImageEnhance.Color(image).enhance(SATURATION)
     image = ImageEnhance.Contrast(image).enhance(CONTRAST)
     image = ImageEnhance.Brightness(image).enhance(BRIGHTNESS)
+    image = ImageEnhance.Sharpness(image).enhance(SHARPNESS)
     return image
+
+
+def _world_to_basemap_pixel(
+    x: float,
+    y: float,
+    bounds: dict[str, float],
+    width: int,
+    height: int,
+) -> tuple[float, float]:
+    px = (x - bounds["minx"]) / (bounds["maxx"] - bounds["minx"]) * (width - 1)
+    py = (bounds["maxy"] - y) / (bounds["maxy"] - bounds["miny"]) * (height - 1)
+    return px, py
+
+
+def overlay_openspace_fills(image: Image.Image, metadata: dict, output_dir: Path | None = None) -> Image.Image:
+    """Paint local/OSM greenspace on top. Water stays MapLibre-only (avoids duplicate ghosts)."""
+    from PIL import ImageDraw
+
+    export_bounds = metadata["bounds"]["export"]
+    epsg = metadata["projection"]["epsg"]
+    width, height = image.size
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
+    fill_local = tuple(OPENSPACE_LOCAL_RGBA)
+    fill_osm = tuple(OPENSPACE_OSM_RGBA)
+    painted_local = 0
+    painted_osm = 0
+
+    def _paint_geom(geom, fill) -> int:
+        count = 0
+        if geom is None or geom.is_empty:
+            return 0
+        for poly in getattr(geom, "geoms", [geom]):
+            if not isinstance(poly, Polygon) or poly.is_empty:
+                continue
+            ring = [
+                _world_to_basemap_pixel(float(x), float(y), export_bounds, width, height)
+                for x, y in poly.exterior.coords
+            ]
+            if len(ring) >= 3:
+                draw.polygon(ring, fill=fill)
+                count += 1
+        return count
+
+    layer_rows = (metadata.get("bounds") or {}).get("layers") or metadata.get("layers") or []
+    openspace_folders: list[Path] = []
+    for row in layer_rows:
+        name = str(row.get("name") or "").lower()
+        folder = row.get("folder")
+        if folder and any(k in name for k in ("openspace", "open space", "park", "green space", "greenspace")):
+            openspace_folders.append(Path(folder))
+    if not openspace_folders:
+        source = metadata.get("source_folder")
+        if source:
+            root = Path(source)
+            if root.is_dir():
+                for sub in root.iterdir():
+                    if sub.is_dir() and any(
+                        k in sub.name.lower()
+                        for k in ("openspace", "open space", "park", "green space", "greenspace")
+                    ):
+                        openspace_folders.append(sub)
+
+    for folder in openspace_folders:
+        shps = list(folder.glob("*.shp"))
+        if not shps:
+            continue
+        try:
+            gdf = gpd.read_file(shps[0])
+        except Exception as exc:
+            print(f"  WARNING: openspace overlay skipped ({folder.name}): {exc}")
+            continue
+        if gdf.crs is None:
+            gdf = gdf.set_crs(epsg=epsg)
+        else:
+            gdf = gdf.to_crs(epsg=epsg)
+        for _, row in gdf.iterrows():
+            # Skip water-purpose parcels — MapLibre water layer already draws them.
+            prim = str(row.get("prim_purp") or "").upper()
+            site = str(row.get("site_name") or "").lower()
+            if prim == "W" or "reservoir" in site:
+                continue
+            painted_local += _paint_geom(row.geometry, fill_local)
+
+    cache_path = (output_dir or Path(".")) / "site_model_osm.geo.json"
+    if cache_path.is_file():
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"  WARNING: OSM greenspace overlay skipped: {exc}")
+            payload = {}
+        for feature in payload.get("features") or []:
+            props = feature.get("properties") or {}
+            tags = props.get("tags") if isinstance(props.get("tags"), dict) else props
+            leisure = str(tags.get("leisure", "")).lower()
+            landuse = str(tags.get("landuse", "")).lower()
+            natural = str(tags.get("natural", "")).lower()
+            is_wood = natural in {"wood", "scrub"} or landuse in {"forest"}
+            if is_wood:
+                continue
+            is_green = (
+                leisure in {"park", "garden", "playground", "nature_reserve", "pitch", "golf_course"}
+                or landuse
+                in {
+                    "grass",
+                    "meadow",
+                    "recreation_ground",
+                    "village_green",
+                    "cemetery",
+                    "allotments",
+                    "orchard",
+                    "vineyard",
+                    "greenfield",
+                }
+                or natural in {"grassland"}
+            )
+            if not is_green:
+                continue
+            try:
+                geom = shape(feature["geometry"])
+            except Exception:
+                continue
+            painted_osm += _paint_geom(geom, fill_osm)
+
+    if painted_local == 0 and painted_osm == 0:
+        print("  Openspace overlay: nothing painted")
+        return image
+    print(f"  Overlaid greenspace fills: local={painted_local}, OSM={painted_osm}")
+    return Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
 
 
 def array_to_rgb_image(array: np.ndarray) -> Image.Image:
@@ -980,14 +1144,23 @@ def export_basemap(metadata: dict, output_dir: Path) -> dict:
     elif BASE_STYLE in OPENFREEMAP_BASEMAP_STYLES:
         from basemap_openfreemap import render_openfreemap_basemap
 
-        print("  Rendering OpenFreeMap (MapLibre, no labels)...")
+        print("  Rendering OpenFreeMap (MapLibre, SW palette, no labels)...")
         map_image = render_openfreemap_basemap(
             bbox_wgs84,
             target_width,
             target_height,
             BASE_STYLE,
             tile_max_px=BASEMAP_OPENFREEMAP_TILE_MAX_PX,
+            palette=BASEMAP_PALETTE,
+            park_rgb=BASEMAP_PARK_RGB,
+            wood_rgb=BASEMAP_WOOD_RGB,
         )
+        print(
+            f"  Adjustments: sat={SATURATION}, contrast={CONTRAST}, "
+            f"bright={BRIGHTNESS}, sharp={SHARPNESS}"
+        )
+        map_image = apply_image_adjustments(map_image)
+        map_image = overlay_openspace_fills(map_image, metadata, output_dir)
     elif BASE_STYLE == "Imagery":
         provider = tile_basemap_provider("Imagery")
         print("  Downloading Esri imagery tiles...")
@@ -1015,7 +1188,7 @@ def export_basemap(metadata: dict, output_dir: Path) -> dict:
     output_bbox = output_dir / "basemap_bbox.txt"
 
     # Allow large 300 DPI exports (PIL default limit blocks ~591 MP images).
-    Image.MAX_IMAGE_PIXELS = max(Image.MAX_IMAGE_PIXELS, target_width * target_height * 2)
+    Image.MAX_IMAGE_PIXELS = max(Image.MAX_IMAGE_PIXELS or 0, target_width * target_height * 2)
     map_image.save(output_png, dpi=(OUTPUT_DPI, OUTPUT_DPI))
     save_geotiff(output_tif, final_img, bbox_wgs84)
 
