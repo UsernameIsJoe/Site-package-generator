@@ -151,11 +151,12 @@ SITE_MODEL_CONTOUR_INTERVAL_M = 1.0
 # For large sites (~20 km²) use 50–80; small sites can use 30–40.
 SITE_MODEL_TERRAIN_GRID_SIZE = 60
 
-# Building extrusion when OSM has no height / building:levels.
-SITE_MODEL_DEFAULT_BUILDING_HEIGHT_M = 10.0
+# Building extrusion when OSM has no height / building:levels:
+# randomly 7.0 or 8.5 m (see site_model_3d.UNKNOWN_BUILDING_HEIGHTS_M).
+SITE_MODEL_DEFAULT_BUILDING_HEIGHT_M = 10.0  # unused for unknowns; kept for API compat
 SITE_MODEL_METERS_PER_LEVEL = 3.0
 
-# Roads are always exported as draped centerline curves (no width surfaces).
+# Roads / parks / water / parking export as draped centerline / outline curves.
 SITE_MODEL_ROAD_SURFACES = False
 
 

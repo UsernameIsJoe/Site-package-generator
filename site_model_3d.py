@@ -8,7 +8,9 @@ padding distance, fetches OSM features via Overpass, and writes a layered .3dm.
 
 from __future__ import annotations
 
+import json
 import math
+import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +20,7 @@ import numpy as np
 import requests
 import rhino3dm
 from pyproj import Transformer
-from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon, shape
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon, mapping, shape
 
 try:
     import osm2geojson
@@ -129,6 +131,19 @@ def parse_metric_tag(value: Any, default: float | None = None) -> float | None:
         return default
 
 
+# When OSM/GIS has no height or building:levels, pick one of these at random.
+UNKNOWN_BUILDING_HEIGHTS_M = (7.0, 8.5)
+
+# Sink building solids this many meters below the terrain sample under the footprint.
+BUILDING_SINK_M = 1.0
+
+# Densify park/water/etc. outline curves so they follow terrain between vertices.
+SURFACE_OUTLINE_MAX_SEGMENT_M = 5.0
+
+# These layers used to be thin extrusion pads; export as draped outline curves instead.
+SURFACE_OUTLINE_LAYERS = frozenset({"Water", "Parks_OpenSpace", "Parking", "Landuse"})
+
+
 def building_height_m(props: dict, default_height: float, meters_per_level: float) -> float:
     height = parse_metric_tag(props.get("height"))
     if height is not None and height > 0:
@@ -136,7 +151,48 @@ def building_height_m(props: dict, default_height: float, meters_per_level: floa
     levels = parse_metric_tag(props.get("building:levels"))
     if levels is not None and levels > 0:
         return levels * meters_per_level
-    return default_height
+    # No height / levels: randomly 7.0 or 8.5 m (default_height unused).
+    _ = default_height
+    return float(random.choice(UNKNOWN_BUILDING_HEIGHTS_M))
+
+
+def densify_linestring(line: LineString, max_segment_m: float = SURFACE_OUTLINE_MAX_SEGMENT_M) -> LineString:
+    """Insert vertices so draped curves follow terrain between sparse corners."""
+    if line.is_empty or line.length <= max_segment_m:
+        return line
+    count = max(2, int(math.ceil(line.length / max_segment_m)) + 1)
+    coords = [line.interpolate(float(d)).coords[0] for d in np.linspace(0.0, line.length, count)]
+    return LineString(coords)
+
+
+def polygon_rings_as_lines(polygon: Polygon) -> list[LineString]:
+    rings: list[LineString] = []
+    if len(polygon.exterior.coords) >= 2:
+        rings.append(LineString(polygon.exterior.coords))
+    for interior in polygon.interiors:
+        if len(interior.coords) >= 2:
+            rings.append(LineString(interior.coords))
+    return rings
+
+
+def add_polygon_outline_on_terrain(
+    model: rhino3dm.File3dm,
+    polygon: Polygon,
+    layer_index: int,
+    terrain: TerrainGrid | None,
+    origin_x: float,
+    origin_y: float,
+    *,
+    max_segment_m: float = SURFACE_OUTLINE_MAX_SEGMENT_M,
+    z_boost: float = 0.05,
+) -> int:
+    """Add densified outline rings as curves draped on terrain (no surface pads)."""
+    added = 0
+    for ring in polygon_rings_as_lines(polygon):
+        dense = densify_linestring(ring, max_segment_m=max_segment_m)
+        if add_line_on_terrain(model, dense, layer_index, terrain, origin_x, origin_y, z_boost=z_boost):
+            added += 1
+    return added
 
 
 def road_width_m(props: dict) -> float:
@@ -393,6 +449,87 @@ def load_local_gis_features(
             added += 1
         print(f"  Local GIS fallback ({role}): {added} from '{sub.name}'")
 
+    return features
+
+
+def features_to_geojson(features: list[dict]) -> dict:
+    out = []
+    for feature in features:
+        geom = feature.get("geometry")
+        if geom is None:
+            continue
+        if hasattr(geom, "__geo_interface__"):
+            geom = mapping(geom)
+        out.append(
+            {
+                "type": "Feature",
+                "geometry": geom,
+                "properties": feature.get("properties") or {},
+            }
+        )
+    return {"type": "FeatureCollection", "features": out}
+
+
+def features_from_geojson_file(path: Path) -> list[dict]:
+    if not path.is_file():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"  WARNING: could not read OSM cache {path.name}: {exc}")
+        return []
+    features: list[dict] = []
+    for feature in payload.get("features") or []:
+        geom = feature.get("geometry")
+        if not geom:
+            continue
+        try:
+            shapely_geom = shape(geom)
+        except Exception:
+            continue
+        if shapely_geom.is_empty:
+            continue
+        features.append({"geometry": shapely_geom, "properties": feature.get("properties") or {}})
+    return features
+
+
+def load_or_refresh_osm_features(
+    features: list[dict],
+    output_dir: Path,
+    *,
+    area_km2: float = 1.0,
+    min_keep_ratio: float = 0.75,
+) -> list[dict]:
+    """Keep the richer of a fresh OSM pull vs last good cache (Overpass is flaky)."""
+    cache_path = output_dir / "site_model_osm.geo.json"
+    cached = features_from_geojson_file(cache_path)
+    min_to_cache = max(300, int(area_km2 * 400))
+
+    if cached and len(features) < max(1, int(len(cached) * min_keep_ratio)):
+        print(
+            f"  OSM fetch sparse ({len(features)} features); "
+            f"reusing cache ({len(cached)} features from {cache_path.name})."
+        )
+        return cached
+    if not features and cached:
+        print(f"  OSM empty; reusing cache ({len(cached)} features).")
+        return cached
+    if len(features) >= min_to_cache and len(features) > len(cached):
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(
+                json.dumps(features_to_geojson(features), ensure_ascii=False),
+                encoding="utf-8",
+            )
+            print(f"  Cached OSM features ({len(features)}) -> {cache_path.name}")
+        except Exception as exc:
+            print(f"  WARNING: could not write OSM cache: {exc}")
+    elif not cached and 0 < len(features) < min_to_cache:
+        print(
+            f"  WARNING: OSM returned only {len(features)} features "
+            f"(expected ~{min_to_cache}+ for this area). Parks/water may be incomplete; "
+            "re-run later when Overpass is healthier to build a cache."
+        )
     return features
 
 
@@ -772,6 +909,8 @@ def add_polygon_extrusion(
     origin_y: float,
     height: float,
     base_boost: float = 0.0,
+    *,
+    base_z: float | None = None,
 ) -> bool:
     exterior = list(polygon.exterior.coords)
     if exterior[0] != exterior[-1]:
@@ -779,11 +918,12 @@ def add_polygon_extrusion(
     if len(exterior) < 4:
         return False
 
-    # Flat base at the HIGHEST terrain under the footprint so solids are never buried.
-    if terrain is not None:
-        base_z = terrain.sample_z_max(polygon) + base_boost
-    else:
-        base_z = base_boost
+    if base_z is None:
+        # Default: flat base at the HIGHEST terrain under the footprint.
+        if terrain is not None:
+            base_z = terrain.sample_z_max(polygon) + base_boost
+        else:
+            base_z = base_boost
     height = abs(float(height))
     if height <= 0:
         height = 0.05
@@ -804,17 +944,23 @@ def add_polygon_extrusion(
         return True
 
     # Extrusion.Create can point "up" or "down" depending on curve winding.
-    # Force the solid to sit ON the terrain: Min.Z == base_z, Max.Z == base_z + height.
+    # Force Min.Z == base_z, Max.Z == base_z + height.
     bb = extrusion.GetBoundingBox()
     if abs(bb.Min.Z - base_z) > 1e-3:
         extrusion.Transform(rhino3dm.Transform.Translation(0.0, 0.0, base_z - bb.Min.Z))
         bb = extrusion.GetBoundingBox()
-    # If it still extends below the base (shouldn't), push up by full height.
     if bb.Max.Z < base_z + height * 0.5:
         extrusion.Transform(rhino3dm.Transform.Translation(0.0, 0.0, height))
 
     model.Objects.AddExtrusion(extrusion, attrs)
     return True
+
+
+def building_base_z(polygon: Polygon, terrain: TerrainGrid | None, sink_m: float = BUILDING_SINK_M) -> float:
+    """Bottom face Z so the footprint centroid sits sink_m below terrain at that point."""
+    c = polygon.centroid
+    ground = terrain.sample_z(float(c.x), float(c.y)) if terrain is not None else 0.0
+    return ground - sink_m
 
 
 def add_line_on_terrain(
@@ -876,7 +1022,9 @@ def write_site_model_readme(path: Path, info: dict[str, Any]) -> None:
             "  Buildings / roads / parks / water: OpenStreetMap (ODbL)",
             "  Terrain mesh + contours: NASA SRTM via OpenTopoData / Open-Meteo",
             "",
-            "Open site_model.3dm in Rhino. Buildings sit on the terrain mesh.",
+            "Open site_model.3dm in Rhino.",
+            "  Buildings: extruded solids; bottom centroid sits 1 m below terrain.",
+            "  Roads / parks / water / parking: curves draped on the terrain mesh.",
         ]
     )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -959,6 +1107,7 @@ def create_site_model(
     features = project_geojson_to_crs(geojson, source_epsg)
     features = clip_features(features, model_bounds)
     print(f"  OSM features after clip: {len(features)}")
+    features = load_or_refresh_osm_features(features, output_dir, area_km2=area_km2(model_bounds))
 
     has_buildings = any(classify_feature(feature_props(f["properties"])) == "Buildings" for f in features)
     has_roads = any(
@@ -980,9 +1129,8 @@ def create_site_model(
         if not has_roads and local_roads:
             features.extend(local_roads)
             print(f"  Added {len(local_roads)} local GIS road centerlines.")
-        if local_parks and not any(
-            classify_feature(feature_props(f["properties"])) == "Parks_OpenSpace" for f in features
-        ):
+        # Always merge local openspace — do not drop it when OSM returns a partial park set.
+        if local_parks:
             features.extend(local_parks)
             print(f"  Added {len(local_parks)} local GIS openspace/park polygons.")
         print(f"  Features after local GIS merge: {len(features)}")
@@ -1029,7 +1177,16 @@ def create_site_model(
         if layer_name == "Buildings":
             height = building_height_m(props, default_building_height_m, meters_per_level)
             for poly in iter_polygons(geom):
-                if add_polygon_extrusion(model, poly, idx, terrain, origin_x, origin_y, height):
+                if add_polygon_extrusion(
+                    model,
+                    poly,
+                    idx,
+                    terrain,
+                    origin_x,
+                    origin_y,
+                    height,
+                    base_z=building_base_z(poly, terrain, BUILDING_SINK_M),
+                ):
                     layer_counts[layer_name] += 1
             continue
 
@@ -1050,12 +1207,15 @@ def create_site_model(
                     layer_counts[layer_name] += 1
             continue
 
-        if layer_name == "Water":
+        # Parks, water, parking, landuse: outline curves draped on terrain (not pads).
+        if layer_name in SURFACE_OUTLINE_LAYERS:
             for poly in iter_polygons(geom):
-                if add_polygon_extrusion(model, poly, idx, terrain, origin_x, origin_y, height=0.05, base_boost=-0.15):
-                    layer_counts[layer_name] += 1
+                layer_counts[layer_name] += add_polygon_outline_on_terrain(
+                    model, poly, idx, terrain, origin_x, origin_y
+                )
             for line in iter_lines(geom):
-                if add_line_on_terrain(model, line, idx, terrain, origin_x, origin_y):
+                dense = densify_linestring(line)
+                if add_line_on_terrain(model, dense, idx, terrain, origin_x, origin_y):
                     layer_counts[layer_name] += 1
             continue
 
