@@ -5,16 +5,24 @@ __pycache__/
 .env
 .env.*
 
-# Large generated map outputs (kept locally, not in git)
-output/**/*.png
-output/**/*.tif
-output/**/*.pdf
-output/**/*.svg
-
-# Shapefile binaries (large; source data stays local)
+# Local GIS source folders (shapefiles stay on disk, not in git)
+Ward/
+Underwood/
+Archive/
 att/**/*.shp
 att/**/*.shx
 att/**/*.dbf
+
+# Generated outputs
+output/
+**/*.3dm
+**/*.png
+**/*.tif
+
+# Scratch / local helpers
+_probe_overpass.py
+_rebuild_ward_3d.py
+.vscode/
 
 # Jupyter
 .ipynb_checkpoints/
